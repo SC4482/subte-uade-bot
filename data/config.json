@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "timezone": "America/Argentina/Buenos_Aires",
+  "origin_corner": "Av. Luis María Campos y Av. Federico Lacroze",
+  "active_days": [
+    "mar",
+    "mie",
+    "jue",
+    "vie"
+  ],
+  "turno": "noche",
+  "alert_window": {
+    "start": "16:30",
+    "end": "23:30"
+  },
+  "scheduled_reports": {
+    "enabled": true,
+    "ida": "17:30",
+    "vuelta": "21:45"
+  },
+  "notify_on_recovery": true
+}
