@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -835,13 +836,16 @@ def detect_transition(previous_state: dict, report: CommuteReport, notify_on_rec
 # ========================================================================
 # Módulo: scraper.py
 # ========================================================================
-"""Obtención del estado en tiempo real del Subte (Web oficial GCBA + API Transporte opcional)."""
+"""Obtención multi-fuente del estado en tiempo real del Subte de Buenos Aires."""
 
 
 
 AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 GCBA_HOME_URL = "https://buenosaires.gob.ar/"
+METROVIAS_PANEL_URL = "https://aplicacioneswp.metrovias.com.ar/estadolineas/desktop.html"
+SUBTEAR_URL = "https://subte.ar/"
+
 GCBA_API_URLS = (
     "https://apitransporte.buenosaires.gob.ar/subtes/serviceAlerts",
     "https://datosabiertos-transporte-apis.buenosaires.gob.ar/subtes/serviceAlerts",
@@ -849,19 +853,51 @@ GCBA_API_URLS = (
 
 SUBTE_LINES = ("A", "B", "C", "D", "E", "H")
 
-# Cabeceras habituales que aparecen debajo del nombre de línea en buenosaires.gob.ar
+# Cabeceras habituales que aparecen debajo del nombre de línea en buenosaires.gob.ar / subte.ar
 TERMINAL_DESCRIPTIONS = (
     "plaza de mayo - san pedrito",
+    "plaza de mayo – san pedrito",
     "j.m. rosas - l.n. alem",
-    "juan manuel de rosas - leandro n. alem",
+    "leandro n. alem",
+    "juan manuel de rosas",
     "constitución - retiro",
     "constitucion - retiro",
+    "retiro - constitución",
+    "retiro – constitución",
     "congreso de tucumán - catedral",
     "congreso de tucuman - catedral",
+    "catedral - congreso de tucumán",
+    "catedral – congreso de tucumán",
     "retiro - plaza de los virreyes",
+    "retiro – plaza de los virreyes",
     "hospitales - facultad de derecho",
+    "facultad de derecho",
     "int. saguier",
+    "intendente saguier",
 )
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Extrae todos los nodos de texto del DOM (incluso dentro de acordeones cerrados con display:none)
+DOM_TEXT_WALKER_JS = """() => {
+    if (!document.body) return '';
+    const out = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (parent) {
+            const tag = parent.tagName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') continue;
+        }
+        const txt = node.nodeValue ? node.nodeValue.trim() : '';
+        if (txt) out.push(txt);
+    }
+    return out.join('\\n');
+}"""
 
 
 @dataclass
@@ -873,27 +909,66 @@ class SubteStatusSnapshot:
     updated_at: str
 
 
-def _clean_status_line(raw: str) -> str:
-    """Limpia nombres de íconos Material Icons ('check_circle', 'warning', etc.) y espacios."""
+def _normalize_status_value(raw: str) -> str:
+    """Limpia íconos Material Icons y unifica 'NORMAL' -> 'Servicio normal'."""
     cleaned = re.sub(
         r"^(?:check_circle|warning_amber|warning|error_outline|error|info|lens|circle)\s*",
         "",
         raw.strip(),
         flags=re.IGNORECASE,
     )
-    return " ".join(cleaned.split())
+    cleaned = " ".join(cleaned.split())
+    if cleaned.lower() in ("normal", "servicio normal"):
+        return "Servicio normal"
+    # Si viene todo en MAYÚSCULAS (como en el panel de Metrovías/Emova), pasarlo a formato legible
+    if len(cleaned) > 4 and cleaned.isupper():
+        cleaned = cleaned.capitalize()
+        # Preservar nombres propios frecuentes tras pasar a oración
+        for proper in (
+            "Independencia",
+            "Lavalle",
+            "Diagonal Norte",
+            "Retiro",
+            "Constitución",
+            "Olleros",
+            "Palermo",
+            "Plaza Italia",
+            "Scalabrini Ortiz",
+            "Bulnes",
+            "Agüero",
+            "Pueyrredón",
+            "Facultad de Medicina",
+            "Callao",
+            "Tribunales",
+            "9 de Julio",
+            "Catedral",
+            "Bolívar",
+            "Belgrano",
+            "Entre Ríos",
+            "Urquiza",
+            "Plaza de los Virreyes",
+            "Congreso de Tucumán",
+            "Congreso",
+            "Medrano",
+            "Moreno",
+            "Av. de Mayo",
+            "San Juan",
+            "San José",
+        ):
+            cleaned = re.sub(re.escape(proper.lower()), proper, cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def parse_gcba_rendered_text(text: str) -> tuple[dict[str, str], str]:
     """
-    Extrae el estado de cada línea a partir del texto visible de buenosaires.gob.ar.
-    Funciona con la estructura actual de 'Estado del subte BA'.
+    Extrae el estado de cada línea a partir de los nodos de texto de buenosaires.gob.ar
+    o del panel Info-Subte de Emova/Metrovías.
     """
     lines_out: dict[str, str] = {}
     updated_at = ""
 
     match_update = re.search(
-        r"[ÚU]ltima actualizaci[óo]n:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)",
+        r"[ÚU]ltima actualizaci[óo]n:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4}\s+[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?|[0-9]{1,2}:[0-9]{2}(?:\s*HS)?)",
         text,
         flags=re.IGNORECASE,
     )
@@ -910,27 +985,63 @@ def parse_gcba_rendered_text(text: str) -> tuple[dict[str, str], str]:
         if letter in lines_out:
             continue
 
-        # Buscamos en las próximas líneas el estado (saltando la línea de cabeceras)
-        for offset in range(1, 5):
+        # Buscamos en los siguientes nodos el texto de estado (saltando cabeceras e íconos sueltos)
+        for offset in range(1, 7):
             if idx + offset >= len(raw_lines):
                 break
             candidate = raw_lines[idx + offset]
             cand_lower = candidate.lower()
 
-            # Si es la letra suelta de la siguiente tarjeta o el título de otra línea, frenamos
-            if re.match(r"^[ABCDEHP]$", candidate) or re.match(
-                r"^(?:L[íi]nea\s+[ABCDEH]|Premetro)$", candidate, flags=re.I
+            if re.match(r"^[ABCDEHPU]$", candidate) or re.match(
+                r"^(?:L[íi]nea\s+[ABCDEHPU]|Premetro)$", candidate, flags=re.I
             ):
                 break
 
-            # Saltamos la descripción fija de cabeceras (ej. "Constitución - Retiro")
             if any(term in cand_lower for term in TERMINAL_DESCRIPTIONS):
                 continue
 
-            status_clean = _clean_status_line(candidate)
+            status_clean = _normalize_status_value(candidate)
             if status_clean:
                 lines_out[letter] = status_clean
                 break
+
+    return lines_out, updated_at
+
+
+def parse_subtear_text(raw_html_or_text: str) -> tuple[dict[str, str], str]:
+    """Extrae el estado en vivo desde el HTML o texto de subte.ar (basado en Emova oficial)."""
+    # Quitar scripts/styles si vino HTML crudo
+    cleaned = re.sub(r"<(script|style|noscript)[^>]*>[\s\S]*?</\1>", " ", raw_html_or_text, flags=re.I)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(" ".join(cleaned.split()))
+
+    updated_at = ""
+    m_upd = re.search(r"Actualizado\s+([0-9]{1,2}:[0-9]{2})", cleaned, flags=re.I)
+    if m_upd:
+        today_str = datetime.now(AR_TZ).strftime("%d/%m/%Y")
+        updated_at = f"{today_str} {m_upd.group(1)}"
+
+    # Recortar alrededor del bloque principal de estado si existe
+    start_idx = cleaned.lower().find("estado del servicio ahora")
+    if start_idx != -1:
+        cleaned = cleaned[start_idx : start_idx + 2500]
+
+    patterns = {
+        "A": r"L[íi]nea A\s*Plaza de Mayo\s*[–—-]\s*San Pedrito\s*(.+?)(?=\s*(?:B\s+)?L[íi]nea B)",
+        "B": r"L[íi]nea B\s*Leandro N\.?\s*Alem\s*[–—-]\s*Juan Manuel de Rosas(?:\s*[–—-]\s*Villa Urquiza)?\s*(.+?)(?=\s*(?:C\s+)?L[íi]nea C)",
+        "C": r"L[íi]nea C\s*(?:Retiro\s*[–—-]\s*Constituci[óo]n|Constituci[óo]n\s*[–—-]\s*Retiro)\s*(.+?)(?=\s*(?:D\s+)?L[íi]nea D)",
+        "D": r"L[íi]nea D\s*(?:Catedral\s*[–—-]\s*Congreso de Tucum[áa]n|Congreso de Tucum[áa]n\s*[–—-]\s*Catedral)\s*(.+?)(?=\s*(?:E\s+)?L[íi]nea E)",
+        "E": r"L[íi]nea E\s*Retiro\s*[–—-]\s*Plaza de los Virreyes(?:\s*[–—-]\s*Eva Per[óo]n)?\s*(.+?)(?=\s*(?:H\s+)?L[íi]nea H)",
+        "H": r"L[íi]nea H\s*Facultad de Derecho(?:\s*[–—-]\s*Julieta Lanteri)?\s*[–—-]\s*Hospitales\s*(.+?)(?=\s*(?:P\s*Intendente|Premetro|Fuente:))",
+    }
+
+    lines_out: dict[str, str] = {}
+    for letter, pat in patterns.items():
+        m = re.search(pat, cleaned, flags=re.IGNORECASE)
+        if m:
+            val = _normalize_status_value(m.group(1))
+            if val:
+                lines_out[letter] = val
 
     return lines_out, updated_at
 
@@ -985,7 +1096,6 @@ def parse_gcba_gtfs_json(payload: dict) -> SubteStatusSnapshot:
             if m:
                 matched_lines.add(m.group(1).upper())
 
-        # Si informed_entity vino vacío, intentamos deducir la línea del texto
         if not matched_lines:
             for m in re.finditer(r"L[íi]nea\s+([ABCDEH])\b", combined, flags=re.I):
                 matched_lines.add(m.group(1).upper())
@@ -1024,7 +1134,7 @@ def fetch_from_gcba_api(client_id: str, client_secret: str, timeout: int = 15) -
             url,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "SubteUADEBot/1.0",
+                "User-Agent": BROWSER_USER_AGENT,
             },
         )
         try:
@@ -1038,12 +1148,44 @@ def fetch_from_gcba_api(client_id: str, client_secret: str, timeout: int = 15) -
     raise RuntimeError(f"No se pudo consultar la API Transporte GCBA: {last_err}")
 
 
-def fetch_from_gcba_web_playwright(timeout_ms: int = 35000) -> SubteStatusSnapshot:
+def fetch_from_subtear_http(timeout: int = 12) -> SubteStatusSnapshot:
+    """Intento rápido por HTTP directo (~1 seg) contra subte.ar sin abrir navegador."""
+    req = urllib.request.Request(
+        SUBTEAR_URL,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "es-AR,es;q=0.9",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw_html = resp.read().decode("utf-8", errors="replace")
+
+    parsed_lines, updated_at = parse_subtear_text(raw_html)
+    missing = [ln for ln in ("C", "D", "E") if ln not in parsed_lines]
+    if missing:
+        raise RuntimeError(f"subte.ar HTTP no devolvió líneas {', '.join(missing)}")
+
+    if not updated_at:
+        updated_at = datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M")
+
+    return SubteStatusSnapshot(
+        lines=parsed_lines,
+        source="Emova (vía subte.ar)",
+        updated_at=updated_at,
+    )
+
+
+def fetch_from_gcba_web_playwright(timeout_ms: int = 25000) -> SubteStatusSnapshot:
     """
-    Obtiene el estado en vivo desde https://buenosaires.gob.ar/ sin necesidad de API keys,
-    renderizando el widget oficial 'Estado del subte BA' con Playwright Chromium.
+    Obtiene el estado en vivo probando tres fuentes públicas con respaldo automático:
+    1) Panel oficial Info-Subte de Emova/Metrovías
+    2) Portal oficial buenosaires.gob.ar (leyendo incluso acordeones cerrados con TreeWalker)
+    3) subte.ar renderizado
     """
     from playwright.sync_api import sync_playwright
+
+    errors: list[str] = []
 
     with sync_playwright() as p:
         launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -1051,56 +1193,92 @@ def fetch_from_gcba_web_playwright(timeout_ms: int = 35000) -> SubteStatusSnapsh
             browser = p.chromium.launch(channel="chrome", headless=True, args=launch_args)
         except Exception:  # noqa: BLE001
             browser = p.chromium.launch(headless=True, args=launch_args)
+
         try:
             context = browser.new_context(
                 locale="es-AR",
                 timezone_id="America/Argentina/Buenos_Aires",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
+                user_agent=BROWSER_USER_AGENT,
             )
             page = context.new_page()
-            # Bloqueamos imágenes, fuentes y videos pesados para que cargue el triple de rápido
             page.route(
                 "**/*",
                 lambda route: route.abort()
                 if route.request.resource_type in {"image", "media", "font"}
                 else route.continue_(),
             )
-            page.goto(GCBA_HOME_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_function(
-                """() => {
-                    const txt = document.body ? document.body.innerText : '';
-                    return txt.includes('Línea C') && txt.includes('Línea D') && txt.includes('Línea E');
-                }""",
-                timeout=timeout_ms,
-            )
-            body_text = page.inner_text("body")
+
+            # Fuente A: Panel oficial Info-Subte Emova/Metrovías
+            try:
+                page.goto(METROVIAS_PANEL_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_function(
+                    """() => {
+                        const t = document.body ? document.body.textContent : '';
+                        return /Linea\\s*C\\s*\\S+/i.test(t) && !/Linea\\s*C\\s*Linea\\s*D/i.test(t);
+                    }""",
+                    timeout=15000,
+                )
+                dom_text = page.evaluate(DOM_TEXT_WALKER_JS)
+                parsed, updated = parse_gcba_rendered_text(dom_text)
+                if all(k in parsed for k in ("C", "D", "E")):
+                    return SubteStatusSnapshot(
+                        lines=parsed,
+                        source="Info-Subte Oficial Emova",
+                        updated_at=updated or datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M"),
+                    )
+                errors.append(f"Info-Subte incompleto: {list(parsed.keys())}")
+            except Exception as err_a:  # noqa: BLE001
+                errors.append(f"Info-Subte Emova: {err_a}")
+
+            # Fuente B: buenosaires.gob.ar (usando textContent / TreeWalker para leer el acordeón cerrado)
+            try:
+                page.goto(GCBA_HOME_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_function(
+                    """() => {
+                        const t = document.body ? document.body.textContent : '';
+                        return t.includes('Línea C') && t.includes('Línea D') && t.includes('Línea E');
+                    }""",
+                    timeout=timeout_ms,
+                )
+                dom_text = page.evaluate(DOM_TEXT_WALKER_JS)
+                parsed, updated = parse_gcba_rendered_text(dom_text)
+                if all(k in parsed for k in ("C", "D", "E")):
+                    return SubteStatusSnapshot(
+                        lines=parsed,
+                        source="buenosaires.gob.ar (Estado del Subte BA)",
+                        updated_at=updated or datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M"),
+                    )
+                errors.append(f"GCBA web incompleto: {list(parsed.keys())}")
+            except Exception as err_b:  # noqa: BLE001
+                errors.append(f"buenosaires.gob.ar: {err_b}")
+
+            # Fuente C: subte.ar renderizado
+            try:
+                page.goto(SUBTEAR_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+                html_content = page.content()
+                parsed, updated = parse_subtear_text(html_content)
+                if all(k in parsed for k in ("C", "D", "E")):
+                    return SubteStatusSnapshot(
+                        lines=parsed,
+                        source="Emova (vía subte.ar)",
+                        updated_at=updated or datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M"),
+                    )
+                errors.append(f"subte.ar incompleto: {list(parsed.keys())}")
+            except Exception as err_c:  # noqa: BLE001
+                errors.append(f"subte.ar: {err_c}")
+
         finally:
             browser.close()
 
-    parsed_lines, updated_at = parse_gcba_rendered_text(body_text)
-    missing = [ln for ln in ("C", "D", "E") if ln not in parsed_lines]
-    if missing:
-        raise RuntimeError(
-            f"No se encontraron las líneas {', '.join(missing)} al leer buenosaires.gob.ar"
-        )
-
-    if not updated_at:
-        updated_at = datetime.now(AR_TZ).strftime("%d/%m/%Y %H:%M:%S")
-
-    return SubteStatusSnapshot(
-        lines=parsed_lines,
-        source="buenosaires.gob.ar (Estado del Subte BA)",
-        updated_at=updated_at,
-    )
+    raise RuntimeError("No se pudo obtener el estado del Subte en ninguna fuente: " + " | ".join(errors))
 
 
 def fetch_subte_status() -> SubteStatusSnapshot:
     """
-    Intenta primero la API oficial GCBA si hay credenciales configuradas;
-    si no están (o si la API falla), usa automáticamente la web oficial buenosaires.gob.ar.
+    Cadena de consulta con respaldo automático:
+    1. API oficial Transporte GCBA (si hay credenciales configuradas)
+    2. Consulta HTTP rápida (~1 seg) a subte.ar (espejo del estado oficial de Emova)
+    3. Navegador headless multi-fuente (Info-Subte Emova -> buenosaires.gob.ar -> subte.ar)
     """
     client_id = os.getenv("GCBA_CLIENT_ID", "").strip()
     client_secret = os.getenv("GCBA_CLIENT_SECRET", "").strip()
@@ -1109,7 +1287,12 @@ def fetch_subte_status() -> SubteStatusSnapshot:
         try:
             return fetch_from_gcba_api(client_id, client_secret)
         except Exception as api_err:  # noqa: BLE001
-            print(f"[WARN] Falló API GCBA ({api_err}), usando fallback web buenosaires.gob.ar...")
+            print(f"[WARN] Falló API GCBA ({api_err}), probando fuentes públicas...")
+
+    try:
+        return fetch_from_subtear_http()
+    except Exception as fast_err:  # noqa: BLE001
+        print(f"[INFO] Consulta rápida HTTP no disponible ({fast_err}), usando navegador headless...")
 
     return fetch_from_gcba_web_playwright()
 
@@ -1305,12 +1488,19 @@ class TelegramClient:
             headers["Content-Type"] = "application/json; charset=utf-8"
 
         req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw)
-            if not parsed.get("ok"):
-                raise RuntimeError(f"Telegram API error ({method}): {parsed}")
-            return parsed
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw)
+                if not parsed.get("ok"):
+                    raise RuntimeError(f"Telegram API error ({method}): {parsed}")
+                return parsed
+        except urllib.error.HTTPError as http_err:
+            detail = http_err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Error de Telegram ({http_err.code} en {method}): {detail}. "
+                "Verificá TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID y haber tocado 'Iniciar' (/start) en tu bot."
+            ) from http_err
 
     def send_message(self, text: str, chat_id: str | int | None = None, with_keyboard: bool = True) -> dict:
         target = str(chat_id or self.allowed_chat_id).strip()
