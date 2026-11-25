@@ -1,0 +1,64 @@
+name: Monitoreo Subte UADE
+
+on:
+  schedule:
+    # Cada 15 min de Lunes a Sábado entre las 07:00 y las 20:45 (hora Argentina, UTC-3)
+    - cron: "*/15 10-23 * * 1-6"
+    # Cada 15 min de Lunes a Sábado por la noche entre las 21:00 y las 23:45 (hora Argentina, UTC-3)
+    - cron: "*/15 0-2 * * 2-6,0"
+  workflow_dispatch:
+    inputs:
+      force_report:
+        description: "Enviar reporte de prueba ahora mismo a mi Telegram"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: subte-uade-monitor
+  cancel-in-progress: false
+
+jobs:
+  chequear-subte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: ".github/workflows/subte_monitor.yml"
+
+      - name: Instalar dependencias livianas
+        run: |
+          pip install "playwright>=1.48.0"
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            playwright install --with-deps chromium
+          fi
+
+      - name: Consultar estado del Subte y notificar si corresponde
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GCBA_CLIENT_ID: ${{ secrets.GCBA_CLIENT_ID }}
+          GCBA_CLIENT_SECRET: ${{ secrets.GCBA_CLIENT_SECRET }}
+          FORCE_REPORT: ${{ inputs.force_report }}
+        run: python bot.py
+
+      - name: Guardar estado y configuración si hubo cambios
+        run: |
+          if [ -n "$(git status --porcelain data/)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/
+            git commit -m "chore: actualizar estado del bot [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi
